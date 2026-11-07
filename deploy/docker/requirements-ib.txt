@@ -1,0 +1,22 @@
+# Runtime deps for the Internal Brain (databridge_ib) and the mock platforms, for the image built by
+# deploy/docker/Dockerfile.ib (python:3.13-slim).
+#
+# Only the top-level needs are listed; the Dockerfile installs them with
+#   pip install -r requirements-ib.txt -c databridge/requirements-lock.txt
+# so every transitive package is pinned to the repo's lock file as well.
+#
+#   fastapi, uvicorn, httpx, pydantic   - both apps (httpx is also the provider-neutral model client)
+#   numpy, PyYAML, tzdata               - databridge_ib index / sensitive rules, databridge_core
+#   mcp                                 - databridge_ib.mcp_server and audit_mcp_server (stdio MCP)
+#   python-pptx, XlsxWriter             - deliverables export (.pptx slides with native charts)
+# No model SDK is installed: an optional AI model is reached over plain HTTPS (IB_MODEL_URL).
+fastapi==0.143.0
+uvicorn==0.54.0
+httpx==0.28.1
+pydantic==2.14.1
+numpy==2.5.4
+PyYAML==6.0.3
+tzdata==2026.5
+mcp==1.30.0
+python-pptx==1.0.2
+XlsxWriter==3.2.9

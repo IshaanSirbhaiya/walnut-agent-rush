@@ -1,0 +1,7 @@
+# Shell scripts, compose files and the Caddyfile run on Linux hosts: keep LF on every checkout.
+*.sh text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+Caddyfile text eol=lf
+Dockerfile.* text eol=lf
+*.env.example text eol=lf

@@ -1,0 +1,34 @@
+# packages/convert — the conversion engine (Pillar 2).
+[project]
+name = "databridge-convert"
+version = "0.0.0"
+description = "DataBridge conversion engine: S→S rules, coercions, artifacts (C05-C07); IR + adapters (C01-C04)"
+requires-python = ">=3.11"
+dependencies = [
+  "databridge-core",
+  "databridge-harness",
+  "pydantic>=2.7",
+  "duckdb>=1.0",
+  "jsonata-python>=0.5",
+  "pyarrow>=15",
+  "orjson>=3",
+  "scipy>=1.10",
+  "safetensors>=0.4",
+]
+
+[project.optional-dependencies]
+adapters = ["ruamel.yaml>=0.18", "lxml>=5"]   # C04 semi-structured adapters (PROMPT 6)
+# T-36 document extraction (PDF + scans → text with per-line page geometry). An EXTRA, not a hard
+# dependency: docling pulls a torch-backed layout model, and `databridge-convert` is imported by
+# every other package here — making that mandatory would put a multi-gigabyte install behind
+# `import databridge_core`. `adapters/source/docling_extract.py` imports it lazily and raises a
+# typed `DoclingUnavailable`, and the gateway answers that with a 503 rather than a stack trace.
+# The gateway needs it: install with `pip install -e "packages/convert[docling]"`.
+docling = ["docling>=2.55"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["databridge_convert"]

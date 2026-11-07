@@ -1,0 +1,60 @@
+# Model routing table (02_TRD §A.4). task_class → alias → model id. Swapping a whole deployment
+# to local models (P1) is a PROFILE change, not a code change. The verification model is
+# deliberately a DIFFERENT alias than the generator (adversarial separation reduces correlated
+# failure): point it at a second model to get that separation.
+#
+# Model ids are "<kind>/<name>", reached by the harness's one provider-neutral client
+# (ChatBackend: a chat-completions-style JSON endpoint at IB_MODEL_URL, key IB_MODEL_KEY):
+#   chat/<name>         a hosted endpoint (refused under the airgapped profile)
+#   local/<name>        an endpoint on the customer's own network (only sent to a local host)
+#   local_server/<name> a self-hosted model server with guided decoding (token-level JSON)
+#   offline/hashing-v1  the labelled offline embedding (no endpoint at all)
+# The repo names no model: "default" means IB_MODEL_NAME, "alt" the first IB_MODEL_FALLBACKS
+# name. With IB_MODEL_URL unset, nothing is
+# called and every caller uses its deterministic path.
+routing:
+  # task_class → model alias
+  schema_annotation:        general         # closed-vocab classification
+  rule_proposal:            general         # S→S mapping proposal (C06) — same alias as annotation for now
+  cross_table_inference:    frontier        # multi-hop reasoning → the strongest configured model
+  agentic_orchestration:    frontier
+  entity_extraction:        general
+  entity_resolution_judge:  general
+  document_extraction:      general         # U→S Pydantic extraction (C15, §11.2)
+  sql_generation:           general
+  sql_revision:             general
+  data_to_text:             general
+  template_selection:       general         # C17 §12.2 — pick a template from the library (generator tier)
+  verification_pass:        general_alt     # DIFFERENT model than generator (adversarial separation, C17 §12.3b)
+  brain_query:              primary_llm     # T08 — Company-Brain NL answer over the graph context
+  brain_analysis:           primary_llm     # T08 — labelled [ANALYSIS] reasoning over the graph
+  brain_routing:            primary_llm     # /brain router: graph vs federated, for a question the rules leave undecided (INT5)
+  # --- Walnut clinic (PLAN.md Phase 1) ---
+  intake_extraction:        general         # referring document → normalized IntakeRecord draft
+  intake_classification:    general         # document-type classification (deterministic today)
+  agent_reasoning:          general         # the read-only clinic agent's plan + answer steps
+  # --- Knowledge platform (BUILD_PLAN §5.5) ---
+  agent:                    frontier        # agent_runtime planner loop (plan tools, write the answer/drafts)
+  embed:                    embedding       # passage embeddings (packages/retrieval). No endpoint ⇒
+                                            # the harness uses its LABELLED offline hashing
+                                            # embedding instead (lexical, not semantic)
+
+aliases:
+  # The general-purpose tier and the frontier tier: both the configured model by default.
+  general:     {model: "chat/default"}
+  frontier:    {model: "chat/default"}
+  general_alt: {model: "chat/alt"}                 # a DIFFERENT model: the first IB_MODEL_FALLBACKS name
+  local_main:  {model: "local/default"}            # customer override target
+  local_alt:   {model: "local/alt"}
+  primary_llm: {model: "chat/default"}
+  # No embedding endpoint is assumed: the labelled offline embedding. Set "chat/<name>" to use one.
+  embedding:   {model: "offline/hashing-v1"}
+
+profiles:
+  cloud:   {}                                       # use aliases as-is
+  airgapped:                                        # P1 deployment: every alias → local
+    general: local_main
+    frontier: local_main
+    general_alt: local_alt
+    primary_llm: local_main
+    embedding: {model: "offline/hashing-v1"}

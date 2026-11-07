@@ -1,0 +1,168 @@
+# Walnut Internal Brain: the whole stack on any Docker host.
+#
+#   internet ──443/80──▶ caddy ──(edge)──▶ web:3100 ──(backend)──▶ ib:8100 ──(backend)──▶ mock:8200
+#
+# Only caddy publishes ports. ib, mock and web have NO `ports:` entry, so nothing but Caddy is
+# reachable from outside the host. `backend` is an internal network (no route to the internet); ib is
+# also on `egress` so it can reach an AI model endpoint when IB_MODEL_URL is set (for example Vultr
+# Serverless Inference, https://api.vultrinference.com/v1, set with `deploy.sh configure-model vultr`;
+# any OpenAI-compatible endpoint works the same way). mock never leaves the host. With no model
+# configured, ib makes no outbound call at all.
+#
+# On Vultr: one Cloud Compute VM runs this whole file (deploy/vultr/README.md).
+#
+# Run (deploy.sh does this for you):
+#   docker compose -p walnut --env-file /opt/walnut/walnut.env -f deploy/docker/docker-compose.yml up -d --build
+#
+# Synthetic data only: the platform base URL is pinned to the in-stack mock. There is no variable
+# here for a real Slack/Atlassian/Google base URL or credential, and none must be added.
+
+x-hardening: &hardening
+  restart: unless-stopped
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: ["ALL"]
+  logging:
+    driver: json-file
+    options: {max-size: "10m", max-file: "3"}
+
+services:
+  mock:
+    <<: *hardening
+    # WALNUT_IMAGE_PREFIX: lets two stacks on one Docker host keep separate images (default walnut)
+    image: ${WALNUT_IMAGE_PREFIX:-walnut}-ib:latest
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.ib
+    command: ["python", "-m", "mock_platforms"]
+    environment:
+      MOCK_SVC_TOKEN: "${MOCK_SVC_TOKEN:?set MOCK_SVC_TOKEN in the env file}"
+      MOCK_ADMIN_TOKEN: "${MOCK_ADMIN_TOKEN:?set MOCK_ADMIN_TOKEN in the env file}"
+      MOCK_WEBHOOK_SECRET: "${MOCK_WEBHOOK_SECRET:?set MOCK_WEBHOOK_SECRET in the env file}"
+      MOCK_WEBHOOK_URL: http://ib:8100
+      # the Host the Brain calls the mock by (its Host allowlist refuses anything else with a 400)
+      MOCK_ALLOWED_HOSTS: mock
+    read_only: true
+    tmpfs: ["/tmp"]
+    networks: [backend]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8200/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
+  ib:
+    <<: *hardening
+    image: ${WALNUT_IMAGE_PREFIX:-walnut}-ib:latest
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.ib
+    command: ["python", "-m", "databridge_ib"]
+    depends_on:
+      mock: {condition: service_healthy}
+    environment:
+      # fixed for a deployment (not overridable from the env file)
+      IB_DEPLOYED: "1"                  # refuses dev/short keys; Secure session cookie
+      IB_DEMO_LOGIN: "1"                # persona picker, gated by the passcode below
+      IB_MOCK_BASE: http://mock:8200    # synthetic platforms only
+      IB_ALLOWED_HOSTS: ib              # the Host the web proxy calls the Brain by (Host allowlist)
+      # the public origin: a ticket's source links point here (/api/ib/ib/open/...), not at 127.0.0.1
+      IB_PUBLIC_ORIGIN: "${IB_PUBLIC_ORIGIN:-https://${DOMAIN:?set DOMAIN}}"
+      IB_MODEL_GUARD_DIR: /var/lib/ib-guard   # model spend ledger, outside the demo state
+      # secrets and tunables from the env file
+      IB_DEMO_PASSCODE: "${IB_DEMO_PASSCODE:?set IB_DEMO_PASSCODE - a deployment must be passcode-gated}"
+      IB_TOKEN_KEY: "${IB_TOKEN_KEY:?set IB_TOKEN_KEY (openssl rand -hex 32)}"
+      IB_LEDGER_KEY: "${IB_LEDGER_KEY:?set IB_LEDGER_KEY (openssl rand -hex 32)}"
+      MOCK_SVC_TOKEN: "${MOCK_SVC_TOKEN:?}"
+      MOCK_ADMIN_TOKEN: "${MOCK_ADMIN_TOKEN:?}"
+      MOCK_WEBHOOK_SECRET: "${MOCK_WEBHOOK_SECRET:?}"
+      IB_POLL_S: ${IB_POLL_S:-120}
+      IB_ANCHOR_INTERVAL_S: ${IB_ANCHOR_INTERVAL_S:-900}
+      IB_ANCHOR_FILE: ${IB_ANCHOR_FILE:-}
+      # optional AI model (empty = deterministic quoted answers only)
+      IB_MODEL_URL: ${IB_MODEL_URL:-}
+      IB_MODEL_NAME: ${IB_MODEL_NAME:-}
+      IB_MODEL_KEY: ${IB_MODEL_KEY:-}
+      IB_MODEL_FALLBACKS: ${IB_MODEL_FALLBACKS:-}
+      IB_MODEL_CAP_USD: ${IB_MODEL_CAP_USD:-}
+      IB_MODEL_DAILY_CAP_USD: ${IB_MODEL_DAILY_CAP_USD:-}
+      IB_MODEL_RPM: ${IB_MODEL_RPM:-}
+      IB_MODEL_USER_RPM: ${IB_MODEL_USER_RPM:-}
+      # per-million-token prices so the spend caps count (e.g. from the Vultr inference pricing page)
+      IB_MODEL_PRICE_IN_USD: ${IB_MODEL_PRICE_IN_USD:-}
+      IB_MODEL_PRICE_OUT_USD: ${IB_MODEL_PRICE_OUT_USD:-}
+      IB_MODEL_ANSWER_TIMEOUT_S: ${IB_MODEL_ANSWER_TIMEOUT_S:-}
+      # sent as reasoning.effort (none = no thinking: faster, and the token budget goes to the answer)
+      IB_MODEL_REASONING_EFFORT: ${IB_MODEL_REASONING_EFFORT:-}
+      IB_FORCE_OFFLINE: ${IB_FORCE_OFFLINE:-0}
+      HOME: /tmp
+    read_only: true
+    tmpfs: ["/tmp"]
+    volumes:
+      - ib-var:/var/lib/ib              # ledger, anchors, answer store, index, revocation list
+      - ib-guard:/var/lib/ib-guard      # model spend ledger (kept by `deploy.sh reset`)
+    networks: [backend, egress]
+    healthcheck:
+      # /health answers only after the start-up crawl and index of the whole world (about a minute)
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8100/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 300s
+
+  web:
+    <<: *hardening
+    image: ${WALNUT_IMAGE_PREFIX:-walnut}-web:latest
+    build:
+      context: ../../databridge/apps/internal_brain_web
+      dockerfile: ../../../deploy/docker/Dockerfile.web
+    depends_on:
+      ib: {condition: service_healthy}
+    environment:
+      IB_API_URL: http://ib:8100
+      NEXT_PUBLIC_IB_MOCK: "0"
+      # the browser's Origin behind Caddy's TLS; the proxy's cross-site check compares against it
+      # (override only for a local test on a non-standard port, e.g. https://localhost:4243)
+      IB_PUBLIC_ORIGIN: "${IB_PUBLIC_ORIGIN:-https://${DOMAIN:?set DOMAIN}}"
+      # deployed: developer-only routes answer one 404
+      IB_DEPLOYED: "1"
+    read_only: true
+    tmpfs: ["/tmp", "/app/.next/cache:uid=1000,gid=1000"]
+    networks: [backend, edge]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3100/login').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+
+  caddy:
+    <<: *hardening
+    image: caddy:2.8.4-alpine
+    depends_on:
+      web: {condition: service_healthy}
+    cap_add: ["NET_BIND_SERVICE"]
+    environment:
+      DOMAIN: "${DOMAIN:?set DOMAIN (your domain, or <ip-with-dashes>.sslip.io)}"
+      # the ACME account email: expiry notices, and it is what lets Caddy fall back to ZeroSSL
+      ACME_EMAIL: "${ACME_EMAIL:-ishaan@walnut.sg}"
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data                # TLS certificates: keep across resets (Let's Encrypt rate limits)
+      - caddy-config:/config
+    networks: [edge]
+
+volumes:
+  ib-var:
+  ib-guard:
+  caddy-data:
+  caddy-config:
+
+networks:
+  backend:
+    internal: true
+  egress: {}
+  edge: {}

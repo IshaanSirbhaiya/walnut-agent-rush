@@ -1,0 +1,72 @@
+{
+ "generated_at": "2026-10-30T11:33:38.284059+00:00",
+ "source": "evals/internal_brain/results.json",
+ "git_sha": "cef0ec769e7e177b37d370423073930d8aa70ac4",
+ "stale": false,
+ "run_date": "2026-10-30T10:39:38+00:00",
+ "ib_code_sha256": "e8a1d35c97a6f8e79d5967648cfa4243e3b7cb25a4a9eb268cc02346b1f07992",
+ "full_run": true,
+ "limit": 0,
+ "leaks": 0,
+ "leak_requests": 0,
+ "requests": 7374,
+ "requests_per_mode": 3687,
+ "upper95": 0.0008136696501220504,
+ "payload_requests": 1047,
+ "payload_upper95": 0.0028653295128939827,
+ "violations": 0,
+ "differential": {
+  "pairs": 400,
+  "mismatches": 0,
+  "control_mismatches": 0
+ },
+ "injection": {
+  "requests": 1152,
+  "hard_failures": 0
+ },
+ "recall": {
+  "released": {
+   "fake-capture": 1.0,
+   "extractive": 1.0
+  },
+  "released_all_modes": {
+   "min": 1.0,
+   "max": 1.0
+  }
+ },
+ "cited_recall": {
+  "per_mode": {
+   "fake-capture": 0.9705882352941176,
+   "extractive": 0.9321266968325792
+  },
+  "range": {
+   "min": 0.9321,
+   "max": 0.9706
+  }
+ },
+ "quality_findings": 14,
+ "canaries_valid": true,
+ "runtime_s": 110.9,
+ "per_mode": {
+  "fake-capture": {
+   "requests": 3687,
+   "with_leak": 0,
+   "upper95": 0.0008136696501220504,
+   "with_model_payload": 1047,
+   "refused": 2640
+  },
+  "extractive": {
+   "requests": 3687,
+   "with_leak": 0,
+   "upper95": 0.0008136696501220504,
+   "with_model_payload": 0,
+   "refused": 2673
+  }
+ },
+ "tests": {
+  "backend": 1278,
+  "e2e": 185
+ },
+ "smoke": null,
+ "note": "Numbers are from the latest full evaluation run."
+}

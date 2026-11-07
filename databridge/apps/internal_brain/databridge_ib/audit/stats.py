@@ -1,0 +1,220 @@
+"""Aggregate statistics over the verified access ledger, for the compliance/developer analysis page.
+
+Counts, timings and distributions only: no question text, no answer text, no document titles. The
+input is the stream of verified ledger events (`AccessLedger.events`), so every number on the page is
+derived from the same sealed record the audit console reads.
+"""
+from __future__ import annotations
+
+import datetime as dt
+from collections import Counter, defaultdict
+from typing import Any, Iterable, Optional
+
+#: per-stage timings recorded in ``answer.released.stage_ms``; they end before that final append
+STAGES = ("accept", "gate1", "gate2", "seal", "compose", "release")
+PLATFORMS = ("confluence", "jira", "slack", "drive")
+ALLOWED_VERDICTS = ("verified", "drift_material")      # AccessCheck.allowed
+
+
+def _platform(doc_id: str) -> str:
+    head = str(doc_id).split(":", 1)[0]
+    return head if head in PLATFORMS else "other"
+
+
+def _when(data: dict[str, Any], recorded_at: Optional[str]) -> Optional[dt.datetime]:
+    raw = data.get("event_time") or recorded_at
+    if not raw:
+        return None
+    try:
+        t = dt.datetime.fromisoformat(str(raw))
+    except ValueError:
+        return None
+    return t if t.tzinfo else t.replace(tzinfo=dt.timezone.utc)
+
+
+def _pct(values: list[int], p: float) -> Optional[int]:
+    if not values:
+        return None
+    s = sorted(values)
+    k = max(0, min(len(s) - 1, int(round(p * (len(s) - 1)))))
+    return s[k]
+
+
+def compute_stats(events: Iterable[Any], *, now: dt.datetime, days: int = 30,
+                  include_replay: bool = True) -> dict[str, Any]:
+    """`events` yields objects with ``kind``, ``data``, ``seq`` and ``recorded_at`` (LedgerEvent).
+
+    The window is half-open, ``now - days <= event_time < now``: an event dated in the future
+    (clock skew, a mis-dated replay) is never counted."""
+    since = now - dt.timedelta(days=days)
+    kinds: Counter = Counter()
+    channels: Counter = Counter()
+    models: Counter = Counter()
+    gate2_verdicts: Counter = Counter()
+    gate2_reasons: Counter = Counter()
+    per_platform: dict[str, Counter] = defaultdict(Counter)
+    per_user: dict[str, Counter] = defaultdict(Counter)
+    per_day: dict[str, Counter] = defaultdict(Counter)
+    stage_vals: dict[str, list[int]] = defaultdict(list)
+    latencies: list[int] = []
+    totals = Counter()
+    released_by_req: dict[str, set] = {}
+    cited_by_req: dict[str, set] = {}
+    first_seq = last_seq = None
+    head_hash = None
+    for le in events:
+        data = le.data if isinstance(le.data, dict) else {}
+        k = le.kind
+        if first_seq is None:
+            first_seq = le.seq
+        last_seq, head_hash = le.seq, getattr(le, "hash", None)
+        totals["ledger_events"] += 1
+        when = _when(data, getattr(le, "recorded_at", None))
+        if when is None or when < since or when >= now:
+            continue
+        if data.get("synthetic_replay") and not include_replay:
+            continue
+        kinds[k] += 1
+        sub = str(data.get("sub") or "")
+        day = when.date().isoformat()
+        if k == "request.accepted":
+            totals["requests"] += 1
+            channels[str(data.get("channel") or "ui")] += 1
+            per_user[sub]["asked"] += 1
+            per_day[day]["asked"] += 1
+        elif k == "retrieval.decided":
+            considered = list(data.get("considered") or ())
+            released = list(data.get("released") or ())
+            totals["considered"] += len(considered)
+            totals["released_docs"] += len(released)
+            for d in considered:
+                per_platform[_platform(d)]["considered"] += 1
+            for d in released:
+                per_platform[_platform(d)]["released"] += 1
+            released_by_req.setdefault(str(data.get("req_id") or ""), set()).update(map(str, released))
+            for g in data.get("gate2") or ():
+                if not isinstance(g, dict):
+                    continue
+                verdict = str(g.get("verdict") or "")
+                gate2_verdicts[verdict] += 1
+                gate2_reasons[str(g.get("reason_code") or "")] += 1
+                per_platform[_platform(g.get("doc_id", ""))]["gate2_checked"] += 1
+        elif k == "answer.released":
+            refused = bool(data.get("refused"))
+            totals["refused" if refused else "answered"] += 1
+            per_user[sub]["refused" if refused else "answered"] += 1
+            per_day[day]["refused" if refused else "answered"] += 1
+            m = data.get("model") or {}
+            models[f"{m.get('provider', '?')}/{m.get('model', '?')}"] += 1
+            if m.get("fallback_used"):
+                totals["fallback_used"] += 1
+            totals["citations"] += len(data.get("citations") or ())
+            cited_by_req.setdefault(str(data.get("req_id") or ""), set()).update(
+                str(c.get("doc_id")) for c in data.get("citations") or () if isinstance(c, dict))
+            totals["dropped_sentences"] += int(data.get("dropped_sentences_count") or 0)
+            if isinstance(data.get("latency_ms"), int):
+                latencies.append(int(data["latency_ms"]))
+            for st, v in (data.get("stage_ms") or {}).items():
+                if st in STAGES and isinstance(v, int):
+                    stage_vals[st].append(v)
+        elif k == "request.failed":
+            totals["failed"] += 1
+            per_day[day]["failed"] += 1
+        elif k == "audit.reveal":
+            totals["reveals"] += 1
+        elif k == "audit.query":
+            totals["audit_queries"] += 1
+        elif k in ("acl.changed", "membership.changed", "directory.changed"):
+            totals["access_changes"] += 1
+        elif k == "ingest.sync":
+            totals["syncs"] += 1
+        elif k == "map.viewed":
+            totals["map_views"] += 1
+        elif k == "graph.viewed":   # round 5: poll write-ahead and folder-picker rows are not views
+            if data.get("outcome") != "checking" and data.get("mode") != "upload_folders":
+                totals["graph_views"] += 1
+        elif k == "doc.viewed":
+            totals["doc_views"] += 1
+        elif k == "trace.viewed":
+            totals["trace_views"] += 1
+        elif k == "auth.login":
+            totals["logins"] += 1
+        elif k.startswith("action."):
+            totals["actions_" + k.split(".", 1)[1]] += 1
+        elif k.startswith("deliverable.") and data.get("deliverable") == "view":
+            # a page-or-chat decision or a page beside the chat: counted apart, so the
+            # deliverables totals stay what people asked to have made
+            stage = data.get("stage")
+            if k == "deliverable.requested" and stage:
+                totals["views_sources_checked" if stage == "sources" else "views_rewrites"] += 1
+            else:
+                totals["views_" + k.split(".", 1)[1]] += 1
+                if k == "deliverable.created" and data.get("status") in ("page", "chat"):
+                    totals["views_decided_" + str(data.get("status"))] += 1
+        elif k.startswith("deliverable.") and not (k == "deliverable.requested" and data.get("export_format")):
+            totals["deliverables_" + k.split(".", 1)[1]] += 1   # round 4 B2: export rows are not requests
+    allowed = sum(v for key, v in gate2_verdicts.items() if key in ALLOWED_VERDICTS)
+    gate2_total = sum(gate2_verdicts.values())
+    finished = totals["answered"] + totals["refused"]
+    # distinct cited documents per request, counted only where the same request released them, so
+    # the document flow never rises between steps (a citation always comes from a released doc)
+    cited_docs = sum(len(c & released_by_req.get(r, set())) for r, c in cited_by_req.items())
+    return {
+        "window": {"since": since.isoformat(), "until": now.isoformat(), "days": days},
+        "ledger": {"events": totals["ledger_events"], "first_seq": first_seq, "last_seq": last_seq,
+                   "head": head_hash},
+        "totals": {
+            "requests": totals["requests"], "answered": totals["answered"],
+            "refused": totals["refused"], "failed": totals["failed"],
+            "answer_rate": round(totals["answered"] / finished, 4) if finished else None,
+            "citations": totals["citations"], "dropped_sentences": totals["dropped_sentences"],
+            "fallback_used": totals["fallback_used"], "reveals": totals["reveals"],
+            "audit_queries": totals["audit_queries"], "access_changes": totals["access_changes"],
+            "syncs": totals["syncs"], "map_views": totals["map_views"], "logins": totals["logins"],
+            "graph_views": totals["graph_views"], "doc_views": totals["doc_views"],
+            "trace_views": totals["trace_views"],
+            "actions_proposed": totals["actions_proposed"],
+            "actions_confirmed": totals["actions_confirmed"],
+            "actions_executed": totals["actions_executed"],
+            "actions_failed": totals["actions_failed"],
+            "actions_rejected": totals["actions_rejected"],
+            "deliverables_requested": totals["deliverables_requested"],
+            "deliverables_created": totals["deliverables_created"],
+            "deliverables_exported": totals["deliverables_exported"],
+            "deliverables_failed": totals["deliverables_failed"],
+            # views (deliverable="view"): requested/created/failed count the opening and closing rows
+            # of a decision or a page; decided_page/chat split the decisions; sources_checked and
+            # rewrites are the further write-ahead rows (extra documents, the follow-up rewrite)
+            "views_requested": totals["views_requested"],
+            "views_created": totals["views_created"],
+            "views_failed": totals["views_failed"],
+            "views_decided_page": totals["views_decided_page"],
+            "views_decided_chat": totals["views_decided_chat"],
+            "views_sources_checked": totals["views_sources_checked"],
+            "views_rewrites": totals["views_rewrites"],
+        },
+        # requests and documents are different units: two flows, never one funnel
+        "requests_flow": {"asked": totals["requests"], "answered": totals["answered"],
+                          "refused": totals["refused"], "failed": totals["failed"]},
+        "documents_flow": {
+            "considered": totals["considered"], "gate2_checked": gate2_total,
+            "gate2_allowed": allowed, "gate2_denied": gate2_total - allowed,
+            "released": totals["released_docs"], "cited": cited_docs,
+        },
+        "gate2": {"verdicts": dict(gate2_verdicts), "reasons": dict(gate2_reasons)},
+        "latency_ms": {"count": len(latencies), "p50": _pct(latencies, 0.5),
+                       "p95": _pct(latencies, 0.95), "max": max(latencies) if latencies else None,
+                       "mean": round(sum(latencies) / len(latencies)) if latencies else None},
+        "stages_ms": {st: {"p50": _pct(stage_vals[st], 0.5), "p95": _pct(stage_vals[st], 0.95),
+                           "count": len(stage_vals[st])} for st in STAGES},
+        "models": dict(models),
+        "channels": dict(channels),
+        "platforms": {p: dict(per_platform[p]) for p in (*PLATFORMS, "other") if per_platform.get(p)},
+        "people": sorted(({"sub": s, **dict(c)} for s, c in per_user.items() if s),
+                         key=lambda r: (-r.get("asked", 0), r["sub"])),
+        "days": [{"day": d, **dict(per_day[d])} for d in sorted(per_day)],
+        "kinds": dict(kinds),
+    }
+
+
+__all__ = ["compute_stats", "STAGES"]

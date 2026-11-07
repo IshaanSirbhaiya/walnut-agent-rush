@@ -1,0 +1,287 @@
+"""`llm.py` — pack-neutral system prompt (E2E F-04) and config-honouring routing (E2E F-21).
+
+F-04: `/brain/query` was a 500 under `DATABRIDGE_PACKS=workspace` because the system prompt was
+read from `databridge_intake.assistant_config`, which raises `PackConfigError` when no enabled
+pack ships a `config/` directory. The prompt import sits OUTSIDE the handler's fallback `try`, so
+the whole route failed. A pack with no assistant config now gets a generic, pack-agnostic prompt;
+a pack WITH one gets exactly its own prompt; a pack whose assistant config is BROKEN still fails
+loudly (a silent fallback would drop its refusal rules without anyone noticing).
+
+F-21: `build_extraction_harness` remapped the extraction alias to the detected brain-query model
+even when the configured extraction model was reachable, so extraction ran on the wrong model.
+Config routing now wins whenever the routed model is reachable (its endpoint kind is in the
+policy, and `IB_MODEL_URL` and the model's name are set); the fallback applies only when it is
+not, and is recorded in `detect_llm()["routing"]`.
+
+All offline: the endpoint URL is a fake string, and no harness here is ever asked to complete anything except
+the FakeBackend-shaped stubs.
+"""
+from __future__ import annotations
+
+import datetime as dt
+
+import pytest
+
+from conftest import AUTH_HEADERS
+
+
+# --------------------------------------------------------------------------- F-04: prompt
+@pytest.fixture()
+def workspace_env(monkeypatch):
+    """Bind the real `workspace` pack for both the graph vocabulary and the intake pack loader."""
+    from databridge_graph.packs import clear_caches
+    from databridge_intake.assistant import assistant_config
+
+    monkeypatch.setenv("DATABRIDGE_PACKS", "workspace")
+    monkeypatch.delenv("DATABRIDGE_PACK", raising=False)
+    monkeypatch.delenv("DATABRIDGE_PACKS_ROOT", raising=False)
+    clear_caches()
+    assistant_config.cache_clear()
+    yield
+    clear_caches()
+    assistant_config.cache_clear()
+
+
+def _enabled_packs_ship_an_assistant() -> bool:
+    from databridge_intake.pack import enabled_packs, packs_root
+
+    return any((packs_root() / p / "config" / "assistant.yaml").is_file() for p in enabled_packs())
+
+
+def test_system_prompt_under_a_pack_with_no_assistant_config_is_generic(workspace_env):
+    from databridge_gateway import llm
+
+    assert not _enabled_packs_ship_an_assistant(), "workspace grew an assistant config — vacuous"
+    prompt = llm.SYSTEM_PROMPT
+    # The platform prompt, plus the bound packs' attestation lines (review f1 #6) — no pack text.
+    assert prompt == llm.compose_system_prompt(None)
+    assert prompt.startswith(llm.GENERIC_SYSTEM_PROMPT)
+    assert llm.PACK_GUIDANCE_OPEN not in prompt
+
+
+def test_the_generic_prompt_names_no_pack_vocabulary():
+    """Pack-agnostic means it: no node kind of ANY pack on disk appears in it as a word, except
+    the meta-model's own words which every pack is allowed to reuse."""
+    import re
+
+    from databridge_gateway.llm import GENERIC_SYSTEM_PROMPT
+    from databridge_graph.meta import EdgeMetaKind, NodeMetaKind
+    from databridge_graph.packs import load_pack
+    from databridge_intake.pack import packs_root
+
+    meta_words = {m.value for m in NodeMetaKind} | {m.value for m in EdgeMetaKind}
+    kinds: set[str] = set()
+    for d in packs_root().iterdir():
+        if (d / "ontology.yaml").is_file():
+            kinds |= {k for k in load_pack(d.name).node_kinds if k not in meta_words}
+    assert kinds, "no pack kinds were found — the check below is vacuous"
+    words = set(re.findall(r"[a-z_]+", GENERIC_SYSTEM_PROMPT.lower()))
+    assert not (kinds & words), sorted(kinds & words)
+
+
+def test_the_generic_prompt_keeps_the_identity_and_grounding_rules():
+    from databridge_gateway.llm import GENERIC_SYSTEM_PROMPT
+
+    text = GENERIC_SYSTEM_PROMPT.lower()
+    assert "only" in text and "context" in text          # answer only from the given context
+    assert "identity" in text and "verif" in text         # hard constraint 1, pack-neutral
+
+
+def test_system_prompt_under_the_clinic_pack_is_the_platform_prompt(monkeypatch):
+    """Review f2 #2 (superseding f1 #5): the pack's prompt is read — a broken one still fails —
+    but none of its prose is placed in the system message."""
+    from databridge_gateway import llm
+    from databridge_intake.assistant import assistant_config
+
+    monkeypatch.delenv("DATABRIDGE_PACKS", raising=False)
+    assistant_config.cache_clear()
+    try:
+        if not _enabled_packs_ship_an_assistant():
+            pytest.skip("the default deployment enables no pack with an assistant config")
+        assert llm.SYSTEM_PROMPT == llm.compose_system_prompt()
+        assert llm.PACK_GUIDANCE_OPEN not in llm.SYSTEM_PROMPT
+        assert llm.SYSTEM_PROMPT.startswith(llm.GENERIC_SYSTEM_PROMPT)
+    finally:
+        assistant_config.cache_clear()
+
+
+def test_a_broken_assistant_config_still_fails_loudly(tmp_path, monkeypatch):
+    """The fallback is for a pack that ships NO assistant; one that ships a bad one must not be
+    quietly swapped for the generic prompt (its refusal rules would vanish unnoticed)."""
+    from databridge_gateway import llm
+    from databridge_intake.assistant import assistant_config
+
+    root = tmp_path / "packs"
+    (root / "brokenpack" / "config").mkdir(parents=True)
+    (root / "brokenpack" / "config" / "assistant.yaml").write_text(
+        "version: 1\npersona: x\nrefusal_rules: []\n", encoding="utf-8")
+    monkeypatch.setenv("DATABRIDGE_PACKS_ROOT", str(root))
+    monkeypatch.setenv("DATABRIDGE_PACKS", "brokenpack")
+    monkeypatch.delenv("DATABRIDGE_PACK", raising=False)
+    assistant_config.cache_clear()
+    try:
+        with pytest.raises(Exception):
+            llm._system_prompt()
+    finally:
+        assistant_config.cache_clear()
+
+
+def test_brain_query_answers_under_the_workspace_pack(workspace_env, tmp_path, monkeypatch):
+    """F-04 end to end: the keyed branch of `/brain/query` reaches the model with a system
+    prompt, instead of a 500 from the prompt import."""
+    from fastapi.testclient import TestClient
+
+    from databridge_core import SourcePointer
+    from databridge_gateway import create_app
+    from databridge_graph import GraphNode
+    from databridge_graph.kinds import NodeKind
+    from databridge_graph.meta import NodeMetaKind
+    from databridge_graph.packs import active_vocabulary
+
+    monkeypatch.setenv("WALNUT_GRAPH_DB_PATH", str(tmp_path / "graph.db"))
+    monkeypatch.delenv("WALNUT_LOAD_CLINIC_SEED", raising=False)
+    t0 = dt.datetime(2026, 9, 1, tzinfo=dt.timezone.utc)
+    label = "Quillfeather Logistics"
+    org = active_vocabulary().nodes_binding_to(NodeMetaKind.ORGANISATION)[0]
+
+    class _Res:
+        def __init__(self, text):
+            self.text = text
+
+    class _Stub:
+        def __init__(self):
+            self.messages = None
+
+        def complete_text(self, task, messages):
+            self.messages = messages
+            return _Res(f"{label} is in the graph.")
+
+    with TestClient(create_app()) as c:
+        ptr = SourcePointer(source_id="s", kind="doc_span", document_id="d", char_start=0,
+                            char_end=len(label), capture_digest="cd" * 32)
+        # BM25 needs a corpus: with one node every term is in every document and scores <= 0.
+        for i, name in enumerate((label, "Marrowgate Analytics", "Tessellate Foundry",
+                                  "Harbour Lantern Works")):
+            c.app.state.brain.store.add_node(GraphNode(
+                id=f"{org}:n{i}", kind=NodeKind(org), label=name, sources=[ptr],
+                valid_from=t0, system_from=t0))
+        stub = _Stub()
+        monkeypatch.setattr(c.app.state, "brain_llm", stub, raising=False)
+        r = c.post("/brain/query", json={"question": f"Tell me about {label}"},
+                   headers=AUTH_HEADERS)
+        assert r.status_code == 200, r.text
+        assert stub.messages is not None, "the model branch was never reached"
+        from databridge_gateway.llm import GENERIC_SYSTEM_PROMPT
+
+        from databridge_gateway.llm import compose_system_prompt
+
+        assert stub.messages[0] == {"role": "system", "content": compose_system_prompt(None)}
+        assert stub.messages[0]["content"].startswith(GENERIC_SYSTEM_PROMPT)
+        assert r.json()["is_real_llm"] is True
+        g = c.get("/brain/graph", headers=AUTH_HEADERS)
+        assert g.status_code == 200, g.text                  # F-05 through the gateway
+
+
+# --------------------------------------------------------------------------- F-21: routing
+def _cfg():
+    from databridge_core.config import load_model_config
+
+    return load_model_config()
+
+
+def _alias(name):
+    return _cfg()["aliases"][name]["model"]
+
+
+def _model_env(monkeypatch, *, url: bool, name: bool):
+    """The neutral model settings: ``IB_MODEL_URL`` (the endpoint) and ``IB_MODEL_NAME`` (what a
+    routed ``chat/default`` means). Fake values; nothing is ever called."""
+    monkeypatch.delenv("DATABRIDGE_FORCE_GOLD", raising=False)
+    monkeypatch.delenv("IB_MODEL_FALLBACKS", raising=False)
+    for env, on, value in (("IB_MODEL_URL", url, "https://model.example/v1"),
+                           ("IB_MODEL_NAME", name, "test-model")):
+        if on:
+            monkeypatch.setenv(env, value)
+        else:
+            monkeypatch.delenv(env, raising=False)
+
+
+def _with_cfg(monkeypatch, **aliases):
+    """The real models.yaml with some aliases replaced (on a copy)."""
+    import copy
+
+    import databridge_core.config as core_config
+
+    cfg = copy.deepcopy(_cfg())
+    for alias, model in aliases.items():
+        cfg["aliases"][alias] = {"model": model}
+    monkeypatch.setattr(core_config, "load_model_config", lambda *a, **k: cfg)
+    return cfg
+
+
+def _routed_alias(task_class: str) -> str:
+    return _cfg()["routing"][task_class]
+
+
+@pytest.mark.parametrize("task_class", ["intake_extraction", "entity_extraction",
+                                        "schema_annotation"])
+def test_extraction_honours_config_routing_when_the_routed_model_is_reachable(monkeypatch,
+                                                                             task_class):
+    """F-21 reproduction: every model reachable, and extraction must run on what models.yaml
+    routes (not on the detected brain-query model)."""
+    from databridge_gateway.llm import build_extraction_harness, detect_llm
+
+    _model_env(monkeypatch, url=True, name=True)
+    configured = _alias(_routed_alias(task_class))
+    h = build_extraction_harness(detect_llm())
+    assert h is not None
+    assert h._resolve(task_class) == configured
+
+
+def test_extraction_falls_back_only_when_the_routed_model_is_unreachable_and_says_so(monkeypatch):
+    from databridge_gateway.llm import build_extraction_harness, detect_llm
+
+    alias = _routed_alias("intake_extraction")
+    # The extraction model is the configured name (``chat/default``: IB_MODEL_NAME, unset here);
+    # the brain-query model names itself, so only the extraction route is starved.
+    _with_cfg(monkeypatch, **{alias: "chat/default", _routed_alias("brain_query"): "chat/brain-model"})
+    _model_env(monkeypatch, url=True, name=False)
+    d = detect_llm()
+    h = build_extraction_harness(d)
+    assert d["model"] == "chat/brain-model"
+    assert h._resolve("intake_extraction") == d["model"] != "chat/default"
+    route = d["routing"][alias]
+    assert {k: route[k] for k in ("configured", "effective", "fallback")} == \
+        {"configured": "chat/default", "effective": d["model"], "fallback": True}
+    assert "IB_MODEL_NAME" in route["reason"]               # the fallback says why (f2 #7)
+
+
+def test_routing_is_recorded_when_honoured(monkeypatch):
+    from databridge_gateway.llm import detect_llm
+
+    _model_env(monkeypatch, url=True, name=True)
+    alias = _routed_alias("intake_extraction")
+    route = detect_llm()["routing"][alias]
+    assert {k: route[k] for k in ("configured", "effective", "fallback")} == \
+        {"configured": _alias(alias), "effective": _alias(alias), "fallback": False}
+
+
+def test_brain_model_comes_from_config_not_a_literal(monkeypatch):
+    """`detect_llm` used to hardcode one vendor's model id while models.yaml had moved on; the
+    model it reports must be the configured one (here a configured alternate)."""
+    from databridge_gateway.llm import build_query_harness, detect_llm
+
+    brain = _routed_alias("brain_query")
+    _with_cfg(monkeypatch, **{brain: "mysteryprovider/x", f"{brain}_local": "local/brain-local"})
+    _model_env(monkeypatch, url=True, name=True)
+    d = detect_llm()
+    assert d["backend"] == "local" and d["model"] == "local/brain-local"
+    assert build_query_harness(d)._resolve("brain_query") == d["model"]
+
+
+def test_no_endpoint_is_still_the_offline_backend(monkeypatch):
+    from databridge_gateway.llm import build_extraction_harness, detect_llm
+
+    _model_env(monkeypatch, url=False, name=True)
+    d = detect_llm()
+    assert d["backend"] == "fake" and build_extraction_harness(d) is None

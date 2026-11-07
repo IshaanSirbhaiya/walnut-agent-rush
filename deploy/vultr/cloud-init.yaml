@@ -1,0 +1,23 @@
+#cloud-config
+# Walnut on one Vultr Cloud Compute VM (Ubuntu 24.04 LTS x64).
+#
+# Paste this into "Cloud-Init User-Data" when you deploy the server in the Vultr console, or let
+# deploy/vultr/provision.py send it through the Vultr API. Replace REPO_URL below with the PUBLIC git URL
+# of this repository first (provision.py does that for you).
+#
+# What it does on first boot: installs git/curl/openssl/python3, opens 80/443 in ufw (Vultr's Ubuntu
+# images ship with ufw on and only SSH open), clones the repo to /opt/walnut/repo and runs
+# deploy/docker/deploy.sh, which installs Docker, generates every secret on the VM, builds and starts the
+# stack behind Caddy (automatic HTTPS on <ip-with-dashes>.sslip.io) and runs the smoke test.
+#
+# No secret is in this file, on purpose: user-data is readable from the VM's metadata service. The
+# optional model key (Vultr Serverless Inference) is added afterwards over SSH:
+#   sudo bash /opt/walnut/repo/deploy/docker/deploy.sh configure-model vultr
+# Progress: ssh -i ~/.ssh/walnut_vultr root@<ip> 'tail -F /var/log/walnut-deploy.log'
+# (the log starts after the packages install, about a minute in; ufw, clone and deploy all write to it)
+package_update: true
+packages: [git, curl, openssl, ca-certificates, python3, ufw]
+runcmd:
+  # One log for every step, HOME set (cloud-init's scripts have none), and a clear last line either way.
+  - [bash, -c, "export HOME=/root; { ufw allow 22/tcp && ufw allow 80/tcp && ufw allow 443/tcp && ufw --force enable; mkdir -p /opt/walnut && git clone --depth 1 --branch main REPO_URL /opt/walnut/repo && bash /opt/walnut/repo/deploy/docker/deploy.sh deploy; } > /var/log/walnut-deploy.log 2>&1 || echo 'walnut deploy FAILED: read the lines above. A clone failure means the repo is not public yet: make it public, then run the clone and deploy.sh by hand (deploy/vultr/README.md, section 3).' >> /var/log/walnut-deploy.log"]
+final_message: "Walnut first-boot deploy finished after $UPTIME s. Log: /var/log/walnut-deploy.log. Passcode: sudo grep IB_DEMO_PASSCODE /opt/walnut/walnut.env"

@@ -1,0 +1,91 @@
+"""Canonical filesystem locations for the clinic data and fixtures.
+
+Resolved relative to the repo root so every caller (tests, gateway, CLI) agrees on where the
+data lives. The synthetic source CSVs are read from ``fixtures/clinic/source_data/`` — the untouched
+originals — rather than copied again: a second copy of a 300-row master file is a drift hazard,
+and the originals are never edited (AGENTS.md). Fixtures that we *derive* (the split chit letters, the
+walk-in stub) do live under ``databridge/fixtures/clinic/``.
+
+``config_dir()`` is the exception and the point of Phase 1B: the determination rules are
+not this package's, they are the active **pack**'s, and they are resolved from the
+deployment binding rather than from a path relative to this file.
+"""
+from __future__ import annotations
+
+import functools
+import pathlib
+
+
+@functools.lru_cache(maxsize=1)
+def repo_root() -> pathlib.Path:
+    """The git root — the directory containing ``databridge/`` (with its ``fixtures/``).
+
+    Walks up from this file rather than trusting the cwd, so pytest, uvicorn and the CLI all
+    resolve identically no matter where they were launched from.
+    """
+    here = pathlib.Path(__file__).resolve()
+    for parent in here.parents:
+        if (parent / "databridge" / "fixtures").is_dir():
+            return parent
+    raise RuntimeError(
+        f"repo root not found above {here}: expected an ancestor containing 'databridge/fixtures/'")
+
+
+def source_data_dir() -> pathlib.Path:
+    """The synthetic source CSVs (moved from their former top-level folder, 2026-10-13, when
+    the earlier project briefs were removed from this branch). Read-only — never write here."""
+    return repo_root() / "databridge" / "fixtures" / "clinic" / "source_data"
+
+
+def fixtures_dir() -> pathlib.Path:
+    """Derived test fixtures (split chit letters, walk-in stub)."""
+    return repo_root() / "databridge" / "fixtures" / "clinic"
+
+
+def chits_dir() -> pathlib.Path:
+    return fixtures_dir() / "chits"
+
+
+def package_root() -> pathlib.Path:
+    """``packages/intake/databridge_intake`` — this package's own source, and nothing else.
+
+    Kept separate from :func:`config_dir` because they stopped being the same directory. The
+    source-scanning guards (`test_no_issuer_branching`) want the *code*; everything else wants
+    the *rules*, and the rules now live in a pack.
+    """
+    return pathlib.Path(__file__).resolve().parent
+
+
+def config_dir() -> pathlib.Path:
+    """``packs/<active pack>/config`` — the rules/schema tables, read from the ACTIVE PACK.
+
+    This used to be ``packages/intake/databridge_intake/config``: one vertical's behaviour sitting
+    inside the engine, so a second industry could only arrive by editing this package. The tables
+    are now a pack's, resolved through :mod:`databridge_intake.pack` from the deployment binding,
+    and the pipeline that reads them names no pack at all.
+
+    Nothing about the guarantee changed: adding an insurer is still a row in
+    ``coverage_rules.yaml`` and zero code changes (AGENTS.md §Hard constraints 3) — the file just
+    lives beside the ontology that declares the vocabulary it is written in.
+    """
+    from .pack import pack_config_dir
+
+    return pack_config_dir()
+
+
+# --- the three synthetic source CSVs ---------------------------------------------------
+PATIENT_REGISTRY_CSV = "patient_registration_synthetic.csv"
+GENERAL_HEALTH_CSV = "general_health_questionnaire_mock_patients.csv"
+OCCUPATIONAL_HEALTH_CSV = "occupational_health_questionnaire_mock_patients.csv"
+
+
+def patient_registry_csv() -> pathlib.Path:
+    return source_data_dir() / PATIENT_REGISTRY_CSV
+
+
+def general_health_csv() -> pathlib.Path:
+    return source_data_dir() / GENERAL_HEALTH_CSV
+
+
+def occupational_health_csv() -> pathlib.Path:
+    return source_data_dir() / OCCUPATIONAL_HEALTH_CSV

@@ -1,0 +1,513 @@
+"""Demo preflight and pre-warm for Walnut DataBridge (run by scripts/demo_day.ps1).
+
+    .venv/Scripts/python scripts/demo_preflight.py                 # checks only (read-only)
+    .venv/Scripts/python scripts/demo_preflight.py --warm          # + one ask per scripted question
+    .venv/Scripts/python scripts/demo_preflight.py --offline       # the mock build on :3101
+    .venv/Scripts/python scripts/demo_preflight.py --sim-reset     # admin.it -> Simulator reset first
+
+A non-loopback --web is refused unless --allow-remote, and then only over https (the demo sign-in
+and IB_DEMO_PASSCODE go to that origin).
+
+Everything goes through the web app's own proxy (/api/ib/*), the path the stage browser uses, so a
+green line means the browser path works, not only the Python service behind it. The services are
+also probed directly (/health on :8100, :8200, :8300).
+
+The pre-warm asks are REAL asks (channel "ui"), signed in as each demo persona with demo sign-in:
+they appear in the ledger as ordinary asks made before the demo, which is what they are. Nothing
+else is written, except the ledger's own records of the sign-ins, the Verify run and the audit
+reads (every audit read is ledgered by design).
+
+Results are written to var/demo-day/preflight.json, which /present/preflight shows. Exit code 0
+when every required check passed, 1 otherwise. Standard library only.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import http.cookiejar
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any, Optional
+from urllib.parse import urlparse
+
+ROOT = Path(__file__).resolve().parents[1]                     # databridge/
+WEB_DIR = ROOT / "apps" / "internal_brain_web"
+OUT_DEFAULT = ROOT / "var" / "demo-day" / "preflight.json"
+
+# The exact strings of the demo script (components/presenter/script.ts, lib/personas.ts).
+Q_VELQUARRY = "Why has Velquarry Trading's account been restricted, and what should I tell the customer?"
+Q_BAYFRONT = "Why has Bayfront Spice Traders' account been restricted, and what should I tell the customer?"
+Q_JORDAN = ("What's the status of the database migration project and were there any blockers "
+               "raised in Slack last week?")
+CLIPS = ("clipA_compare_amy_rachel_ken.mp4", "clipB_journey_audit_tamper.mp4")
+
+#: Slowest acceptable warm-up ask, by what produced the answer (``ask_limit_s``). A quoted answer
+#: (no model call: model off, a refusal with nothing released, or the D-43 approved-script quote)
+#: keeps the 8 s bar. An answer for which a model was called (a model answer, or a quoted fallback
+#: after the model's draft failed grounding) gets 15 s: measured model answers on the founder's
+#: laptop took 7 to 11 s, so 15 s leaves headroom without hiding a hung call. Opening a source and
+#: the journey never call a model and keep the quoted bar.
+QUOTED_MAX_S = 8.0
+MODEL_MAX_S = 15.0
+
+
+def model_called(model: Optional[dict]) -> bool:
+    """Whether a model was called for an /ib/ask answer, from its ``model`` field alone: any
+    non-deterministic provider, or a deterministic answer that is a fallback after a model try."""
+    m = model or {}
+    if not m:                                   # no model field: nothing says a model was called
+        return False
+    if m.get("provider") != "deterministic" and not str(m.get("model", "")).startswith("extractive"):
+        return True
+    return bool(m.get("fallback_used"))
+
+
+def ask_limit_s(model: Optional[dict], quoted_max_s: float = QUOTED_MAX_S,
+                model_max_s: float = MODEL_MAX_S) -> float:
+    """The slowest acceptable time for one ask, given the answer's ``model`` field."""
+    return model_max_s if model_called(model) else quoted_max_s
+
+
+#: why a quoted answer was served (``model.reason_code``, docs/contracts/backend_v1.md)
+_QUOTED_WHY = {"quoted_approved_script": "approved wording, quoted",
+               "model_rejected_evidence": "quoted, the model's draft failed the evidence check",
+               "model_unavailable": "quoted, the model was unavailable or too slow"}
+
+
+def answer_by(model: Optional[dict]) -> str:
+    """Who wrote a warm-up answer, for the row's text: never a raw model id or a provider key.
+    Any model is "AI model"."""
+    m = model or {}
+    mid = str(m.get("model", ""))
+    if m.get("provider") == "deterministic" or mid.startswith("extractive"):
+        why = _QUOTED_WHY.get(str(m.get("reason_code") or ""))
+        if why:
+            return why
+        return "quoted after a model try" if m.get("fallback_used") else "quoted (no model)"
+    return "AI model"
+
+
+WORLD = ROOT / "fixtures" / "enterprise" / "world.json"
+#: Rachel's three stage facts, by their fact ids in the world's fact manifest (never written down
+#: here as answers): the case trigger (its count), the device link (its "X of Y"), the STR filing
+RACHEL_FACTS = ("FINCRIME-case-confluence", "FINCRIME-case-drive", "FINCRIME-str-confluence")
+_FILED = re.compile(r"\b(filed|filing|lodged|submitted|reported to)\b", re.I)
+
+
+def _facts(world_path: Path = WORLD) -> dict[str, dict]:
+    try:
+        w = json.loads(Path(world_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return {f.get("id"): f for f in w.get("facts") or []}
+
+
+def rachel_facts(body: Optional[dict], world_path: Path = WORLD) -> list[tuple[str, bool]]:
+    """``[(label, present)]`` for Rachel's three stage facts in her answer, derived from the world's
+    fact manifest. A fact counts only when its own document is cited:
+    * the STR filing: the answer says it was filed/lodged and cites the STR decision record;
+    * the count: the trigger's first number (e.g. the number of transfers) is in the answer;
+    * the "X of Y" device link: both of its numbers are in the answer.
+    An empty list when the manifest cannot be read."""
+    facts = _facts(world_path)
+    if not all(k in facts for k in RACHEL_FACTS):
+        return []
+    b = body or {}
+    text = " ".join(str(b.get("answer") or "").split())
+    cited = {str(c.get("doc_id")) for c in b.get("citations") or []}
+    nums = lambda s: re.findall(r"(?<![\d.,])\d+(?![\d.,]*\d)", s)        # noqa: E731
+    have = set(nums(text))
+    trig, dev, strf = (facts[k] for k in RACHEL_FACTS)
+    t_num = (nums(trig["statement"]) or ["?"])[0]
+    d_nums = nums(dev["statement"])[:2]
+    # the filing must be said in a sentence that cites the STR record itself (a generic rule
+    # sentence such as "telling anyone a report has been filed is an offence" does not count)
+    str_tags = {str(c.get("tag")) for c in b.get("citations") or [] if c.get("doc_id") == strf["doc"]}
+    str_said = any(_FILED.search(sent) and any(f"[{t}]" in sent or f"{t}]" in sent for t in str_tags)
+                   for sent in re.split(r"(?<=[.!?])\s+", text))
+    return [
+        ("STR filed", str_said),
+        (f"{t_num} (the trigger count)", trig["doc"] in cited and t_num in have),
+        (f"{' of '.join(d_nums)} (the device link)", dev["doc"] in cited and len(d_nums) == 2
+         and all(n in have for n in d_nums)),
+    ]
+
+
+class Client:
+    """One signed-in browser-like session against the web app's /api/ib proxy."""
+
+    def __init__(self, web: str, timeout: float = 60):
+        self.web = web.rstrip("/")
+        self.timeout = timeout
+        self.jar = http.cookiejar.CookieJar()
+        self.op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.jar))
+
+    def call(self, method: str, path: str, body: Optional[dict] = None, timeout: Optional[float] = None
+             ) -> tuple[int, Any, float]:
+        data = json.dumps(body).encode() if body is not None else None
+        headers = {"Accept": "application/json"}
+        if data is not None:
+            headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(f"{self.web}/api/ib/{path}", data=data, headers=headers, method=method)
+        t0 = time.perf_counter()
+        try:
+            with self.op.open(req, timeout=timeout or self.timeout) as r:
+                raw = r.read()
+                code = r.status
+        except urllib.error.HTTPError as e:
+            raw, code = e.read(), e.code
+        except Exception as e:                                       # noqa: BLE001  (timeout, refused)
+            return 0, {"error": type(e).__name__}, time.perf_counter() - t0
+        secs = time.perf_counter() - t0
+        try:
+            return code, json.loads(raw or b"null"), secs
+        except ValueError:
+            return code, None, secs
+
+    def sign_in(self, persona: str) -> bool:
+        body: dict[str, Any] = {"persona": persona}
+        if os.environ.get("IB_DEMO_PASSCODE"):
+            body["passcode"] = os.environ["IB_DEMO_PASSCODE"]
+        code, _, _ = self.call("POST", "auth/demo-login", body, timeout=15)
+        return code == 200
+
+    def page_ok(self, path: str, timeout: float = 20) -> tuple[bool, str]:
+        """GET a web page with this session's cookie (the preflight board needs a signed-in loopback visitor)."""
+        try:
+            with self.op.open(urllib.request.Request(f"{self.web}{path}", method="GET"), timeout=timeout) as r:
+                return 200 <= r.status < 400, f"HTTP {r.status}"
+        except urllib.error.HTTPError as e:
+            return False, f"HTTP {e.code}"
+        except Exception as e:                                       # noqa: BLE001
+            return False, type(e).__name__
+
+    def sign_out(self) -> None:
+        try:
+            self.call("POST", "auth/logout", {}, timeout=10)
+        except Exception:                                            # noqa: BLE001
+            pass
+
+
+def http_ok(url: str, timeout: float = 4) -> tuple[bool, str]:
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            return 200 <= r.status < 400, f"HTTP {r.status}"
+    except urllib.error.HTTPError as e:
+        return False, f"HTTP {e.code}"
+    except Exception as e:                                           # noqa: BLE001
+        return False, type(e).__name__
+
+
+class Report:
+    def __init__(self):
+        self.items: list[dict[str, Any]] = []
+
+    def add(self, group: str, key: str, label: str, status: str, detail: str = "", **extra: Any) -> None:
+        """status: pass | fail | warn | info."""
+        self.items.append({"group": group, "key": key, "label": label, "status": status,
+                           "detail": detail, **extra})
+        mark = {"pass": "PASS", "fail": "FAIL", "warn": "WARN", "info": "INFO"}[status]
+        print(f"  [{mark}] {label}{(': ' + detail) if detail else ''}", flush=True)
+
+    @property
+    def ok(self) -> bool:
+        return not any(i["status"] == "fail" for i in self.items)
+
+
+def same_refusal(a: dict, b: dict) -> bool:
+    keys = ("answer", "citations", "scope_note", "model")
+    return all(a.get(k) == b.get(k) for k in keys)
+
+
+_LOOPBACK = ("127.0.0.1", "localhost", "::1")
+
+
+def origin_error(url: str, allow_remote: bool) -> str | None:
+    """Why *url* must not receive the demo sign-in (and IB_DEMO_PASSCODE), or None when it may.
+
+    Round 2b finding 6: loopback only by default. A non-loopback host needs --allow-remote, and even
+    then plain http is refused, so the passcode never crosses a network in clear text.
+    """
+    p = urlparse(url)
+    if p.scheme not in ("http", "https") or not p.hostname:
+        return f"{url!r} is not an http(s) origin"
+    if p.username or p.password:
+        return "the origin must not contain credentials"
+    if p.hostname.lower() in _LOOPBACK:
+        return None
+    if not allow_remote:
+        return (f"{p.hostname} is not a loopback host; the demo sign-in (and IB_DEMO_PASSCODE) is sent "
+                "only to 127.0.0.1, localhost or ::1 unless you pass --allow-remote")
+    if p.scheme != "https":
+        return f"{p.hostname} is remote: use https:// (the passcode is never sent over plain http off this machine)"
+    return None
+
+
+def model_line(st: dict, offline: bool) -> tuple[dict, tuple[str, str, str]]:
+    """``(model_info, (label, status, detail))`` from a /ib/status body. "AI model active" only when
+    /ib/status shows an ACTIVE model (``models.active``, never assumed), and the "quoted (no model)"
+    line when none is. ``warm_confirms`` can still take it back after the warm-up."""
+    m = st.get("models") or {}
+    active = bool(m.get("active"))
+    chain = ", ".join(m.get("active_chain") or m.get("chain") or []) or "none"
+    info = {"live": active, "ai": active, "chain": chain,
+            "active_chain": list(m.get("active_chain") or m.get("chain") or []),
+            "force_offline": st.get("force_offline"), "key_configured": st.get("key_configured")}
+    if offline:
+        return info, ("Model", "info", "mock fixtures (offline build)")
+    if active:
+        return info, ("Model: AI model active", "pass", "an AI model answers from the cited sources")
+    why = "IB_FORCE_OFFLINE=1" if st.get("force_offline") else "no AI model configured"
+    return info, ("Model: Quoted from sources (no model)", "warn",
+                  f"{why}; say 'quoted from the sources, with the same checks'. Expected without "
+                  "IB_MODEL_URL and IB_MODEL_NAME")
+
+
+def warm_confirms(info: dict, warm_models: list) -> Optional[tuple[str, str, str]]:
+    """After the warm-up: an active model whose warm answers all came back quoted (no answer model
+    in the active chain) is not really answering. Downgrades ``info`` in place and returns the line
+    that replaces the model line, or None when nothing changes."""
+    if not info.get("ai"):
+        return None
+    chain = set(info.get("active_chain") or [])
+    got = [str(x) for x in warm_models if x]
+    if not got or any(x in chain for x in got):
+        return None
+    info["live"], info["ai"] = False, False
+    return ("Model: Quoted from sources (no model)", "warn",
+            "an AI model is configured but every warm-up answer was quoted (extractive)")
+
+
+def budget_line(st: dict) -> Optional[tuple[str, str, str]]:
+    """``(label, status, detail)`` for the model's guard ("Model budget": numbers only),
+    or None when /ib/status does not show it (it does only to admin and compliance)."""
+    b = st.get("model_budget")
+    if not isinstance(b, dict):
+        return None
+    if not b.get("ok"):
+        return ("Model budget", "warn",
+                "the spend ledger cannot be read: no model calls, answers are quoted (see the checklist)")
+
+    def usd(k: str) -> str:
+        v = b.get(k)
+        return f"US${float(v):.2f}" if isinstance(v, (int, float)) else "?"
+    detail = (f"{usd('spent_usd')} of {usd('total_cap_usd')} spent; today {usd('today_usd')} of "
+              f"{usd('daily_cap_usd')}; {b.get('calls', '?')} calls")
+    if b.get("available"):
+        return ("Model budget", "pass", detail)
+    return ("Model budget", "warn", detail + "; a cap is reached: answers are quoted, pages use the rules")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--offline", action="store_true", help="check the mock build on :3101 (no services)")
+    ap.add_argument("--web", default=None, help="web app origin (default :3100, or :3101 with --offline)")
+    ap.add_argument("--warm", action="store_true", help="ask every scripted question once (real asks)")
+    ap.add_argument("--sim-reset", action="store_true", help="as admin.it, reset the platform simulator first")
+    ap.add_argument("--max-s", type=float, default=QUOTED_MAX_S,
+                    help=f"slowest acceptable quoted (no model) ask, seconds (default {QUOTED_MAX_S:g})")
+    ap.add_argument("--model-max-s", type=float, default=MODEL_MAX_S,
+                    help=f"slowest acceptable ask that called a model, seconds (default {MODEL_MAX_S:g})")
+    ap.add_argument("--out", default=str(OUT_DEFAULT))
+    ap.add_argument("--allow-remote", action="store_true",
+                    help="allow a non-loopback https --web (the demo sign-in and passcode go there)")
+    a = ap.parse_args()
+
+    web = (a.web or ("http://127.0.0.1:3101" if a.offline else "http://127.0.0.1:3100")).rstrip("/")
+    err = origin_error(web, a.allow_remote)
+    if err:
+        print(f"refusing --web: {err}", file=sys.stderr)
+        return 2
+    rep = Report()
+    started = dt.datetime.now().astimezone()
+    print(f"Walnut DataBridge preflight  {started:%Y-%m-%d %H:%M:%S %Z}  ({'OFFLINE mock' if a.offline else 'live'} {web})")
+
+    # -- 1. services ------------------------------------------------------------------------
+    print("Services")
+    ok, why = http_ok(f"{web}/login", timeout=15)
+    rep.add("services", "web", f"Web app {web}", "pass" if ok else "fail", why)
+    if a.offline:
+        rep.add("services", "mode", "Mode", "info", "offline mock build: answers are recorded fixtures, no services used")
+    else:
+        for key, label, url, required in (
+                ("ib", "Internal Brain :8100", "http://127.0.0.1:8100/health", True),
+                ("mock", "Mock platforms :8200 (Confluence, Jira, Slack, Drive)", "http://127.0.0.1:8200/health", True),
+                ("engine", "Walnut engine gateway :8300 (Developer > Brain only)", "http://127.0.0.1:8300/health", False)):
+            ok, why = http_ok(url)
+            rep.add("services", key, label, "pass" if ok else ("fail" if required else "warn"), why)
+
+    # -- 2. clips ---------------------------------------------------------------------------
+    print("Backup clips")
+    for name in CLIPS:
+        f = WEB_DIR / "public" / "clips" / name
+        served, why = http_ok(f"{web}/clips/{name}", timeout=10)
+        if f.exists() and served:
+            rep.add("clips", name, f"Clip {name[4]}  {name}", "pass", f"{f.stat().st_size / 1e6:.1f} MB, served")
+        else:
+            rep.add("clips", name, f"Clip {name[4]}  {name}", "fail",
+                    "missing on disk" if not f.exists() else f"not served by the web app ({why}); rebuild")
+
+    # -- 3. model, ledger, history (as Maya) --------------------------------------------------
+    print("Model and ledger (as maya.compliance)")
+    maya = Client(web)
+    model_info: dict[str, Any] = {}
+    if not maya.sign_in("maya.compliance"):
+        rep.add("ledger", "signin", "Sign in as maya.compliance", "fail", "demo sign-in refused")
+    else:
+        # The board is served only on loopback to a signed-in person (round-4 review track B #2), so check it as Maya.
+        ok, why = maya.page_ok("/present/preflight")
+        rep.add("services", "preflight_page", "Preflight page /present/preflight", "pass" if ok else "warn",
+                why if ok else f"{why} (the web build is older than the demo kit: Stop, then Start, rebuilds it)")
+        if a.sim_reset:
+            adm = Client(web)
+            if adm.sign_in("admin.it"):
+                print("  (Simulator reset re-reads every platform: about 1 minute)", flush=True)
+                code, body, secs = adm.call("POST", "sim/reset", {}, timeout=300)
+                good = code == 200 and isinstance(body, dict) and body.get("ok") is not False
+                rep.add("ledger", "sim_reset", "Simulator reset (admin.it)", "pass" if good else "fail",
+                        f"{secs:.1f}s" if good else f"HTTP {code} {body}")
+                adm.sign_out()
+            else:
+                rep.add("ledger", "sim_reset", "Simulator reset (admin.it)", "fail", "demo sign-in refused")
+        code, st, _ = maya.call("GET", "ib/status", timeout=15)
+        if code == 200 and isinstance(st, dict):
+            model_info, line = model_line(st, a.offline)
+            rep.add("model", "model", *line)
+            bline = None if a.offline else budget_line(st)
+            if bline:
+                rep.add("model", "model_budget", *bline)
+        else:
+            rep.add("model", "model", "Model status /ib/status", "fail", f"HTTP {code}")
+        code, v, secs = maya.call("GET", "audit/verify", timeout=120)
+        if code == 200 and isinstance(v, dict):
+            good = bool(v.get("ok"))
+            rep.add("ledger", "verify", "Audit chain verify (as Maya)", "pass" if good else "fail",
+                    f"{'intact' if good else 'BROKEN'}, {v.get('records', '?')} records, {secs:.1f}s",
+                    records=v.get("records"))
+        else:
+            rep.add("ledger", "verify", "Audit chain verify (as Maya)", "fail", f"HTTP {code}")
+        code, s, _ = maya.call("GET", "audit/stats?days=30", timeout=60)
+        if code == 200 and isinstance(s, dict):
+            totals = s.get("totals") or {}
+            req_n = totals.get("requests") or 0
+            ch = s.get("channels") or s.get("by_channel") or {}
+            replay = ch.get("replay") if isinstance(ch, dict) else None
+            detail = f"{req_n} requests in the last 30 days" + (f", {replay} seeded replay" if replay else "")
+            rep.add("ledger", "history", "Seeded demo history", "pass" if req_n >= 100 else "fail",
+                    detail if req_n >= 100 else f"{detail}; reseed with Reset --fresh", requests=req_n)
+        else:
+            rep.add("ledger", "history", "Seeded demo history", "fail", f"HTTP {code}")
+
+    # -- 4. pre-warm: every scripted question once ----------------------------------------------
+    warm: list[dict[str, Any]] = []
+    if a.warm:
+        print(f"Pre-warm (real asks, pass when under {a.max_s:.0f} s quoted, {a.model_max_s:.0f} s with a model)")
+        res: dict[str, dict] = {}
+
+        def ask(key: str, persona: str, who: str, q: str, expect: str) -> Optional[dict]:
+            c = Client(web)
+            if not c.sign_in(persona):
+                rep.add("warm", key, f"{who}: sign-in", "fail", "demo sign-in refused")
+                return None
+            code, body, secs = c.call("POST", "ib/ask", {"question": q}, timeout=90)
+            if code != 200 or not isinstance(body, dict):
+                rep.add("warm", key, f"{who}", "fail", f"HTTP {code} after {secs:.1f}s", seconds=round(secs, 2))
+                return None
+            cites = body.get("citations") or []
+            refused = not cites
+            right = (expect == "refuse") == refused
+            if expect == "answer2":
+                right = len(cites) >= 2
+            limit = ask_limit_s(body.get("model"), a.max_s, a.model_max_s)
+            fast = secs <= limit
+            model = (body.get("model") or {}).get("model", "?")
+            outcome = "refused" if refused else f"answered, {len(cites)} citations"
+            status = "pass" if right and fast else "fail"
+            detail = f"{secs:.1f}s, {outcome}, by {answer_by(body.get('model'))}"
+            if not right:
+                detail += " (NOT what the script expects)"
+            if not fast:
+                detail += f" (slower than {limit:.0f} s)"
+            rep.add("warm", key, who, status, detail, seconds=round(secs, 2), model=model, outcome=outcome,
+                    limit_s=limit)
+            warm.append({"key": key, "persona": persona, "seconds": round(secs, 2), "ok": status == "pass"})
+            res[key] = body
+            if expect == "answer2" and len(cites) >= 2:      # step 3 opens citation [2]: warm the live read
+                d = cites[1].get("doc_id", "")
+                code2, _, s2 = c.call("GET", f"ib/doc/{urllib.request.quote(d, safe='')}", timeout=30)
+                rep.add("warm", "rachel_doc", "Rachel: open citation [2] (sources sheet)",
+                        "pass" if code2 == 200 and s2 <= a.max_s else "fail", f"{s2:.1f}s HTTP {code2}")
+            c.sign_out()
+            return body
+
+        ask("amy", "amy.am", "Amy (account manager): Velquarry", Q_VELQUARRY, "answer")
+        rachel = ask("rachel", "mlro.tan", "Rachel (MLRO): Velquarry", Q_VELQUARRY, "answer2")
+        kv = ask("ken_v", "ken.ext", "Ken (contractor): Velquarry", Q_VELQUARRY, "refuse")
+        kb = ask("ken_b", "ken.ext", "Ken (contractor): Bayfront (made up)", Q_BAYFRONT, "refuse")
+        if kv and kb:
+            same = same_refusal(kv, kb)
+            rep.add("warm", "ken_identical", "Ken's two refusals are identical", "pass" if same else "fail",
+                    "same text, citations, scope note and model" if same else "the two refusals differ")
+        ask("jordan", "jdoe", "Jordan (MCP client question, in-app)", Q_JORDAN, "answer")
+        if rachel:
+            # Story 1 fix #1: the three facts the stage story says aloud. A WARN, never a fail: the
+            # answer is still right without them; the presenter re-asks or uses the recorded clip.
+            got = rachel_facts(rachel)
+            if got:
+                missing = [lab for lab, ok in got if not ok]
+                rep.add("warm", "rachel_facts", "Rachel's answer states the stage facts",
+                        "warn" if missing else "pass",
+                        ("missing: " + ", ".join(missing) + ". Ask again, or play the recorded clip"
+                         if missing else "STR filed, the count and the device link are all stated"),
+                        facts={lab: ok for lab, ok in got})
+        if rachel and maya.jar:
+            rid = rachel.get("request_id", "")
+            code, _, secs = maya.call("GET", f"audit/journey/{rid}", timeout=30)
+            rep.add("warm", "journey", "Maya: journey of Rachel's request", "pass" if code == 200 and secs <= a.max_s else "fail",
+                    f"{secs:.1f}s HTTP {code}")
+        if a.offline:
+            labelled = sorted({str(i.get("model")) for i in rep.items
+                               if i["group"] == "warm" and i.get("model") not in (None, "extractive-v1")})
+            if labelled:
+                rep.add("warm", "fixture_label", "Fixture answers carry a model label", "warn",
+                        f"the mock labels them {', '.join(labelled)}: they are recorded fixtures. Say "
+                        "'this is the recorded fixture mode'; never say a model wrote them")
+        else:
+            # AI model only if the warm-up answers really came from the active chain
+            down = warm_confirms(model_info, [i.get("model") for i in rep.items
+                                              if i["group"] == "warm" and i.get("outcome") != "refused"])
+            if down:
+                for i in rep.items:
+                    if i["key"] == "model":
+                        i.update(label=down[0], status=down[1], detail=down[2])
+                print(f"  [WARN] {down[0]}: {down[2]}", flush=True)
+    maya.sign_out()
+
+    # -- 5. clock -----------------------------------------------------------------------------
+    now = dt.datetime.now().astimezone()
+    off = now.utcoffset() or dt.timedelta(0)
+    rep.add("clock", "clock", "Laptop clock", "pass",
+            f"{now:%a %d %b %H:%M:%S} UTC{off.total_seconds() / 3600:+.0f}")
+
+    out = {"generated_at": now.isoformat(), "mode": "offline" if a.offline else "live", "web": web,
+           "ok": rep.ok, "max_s": a.max_s, "model_max_s": a.model_max_s, "warmed": a.warm, "model": model_info, "warm": warm,
+           "items": rep.items}
+    p = Path(a.out)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(out, indent=2), encoding="utf-8")
+    os.replace(tmp, p)
+    fails = [i["label"] for i in rep.items if i["status"] == "fail"]
+    print(f"\nPREFLIGHT {'GREEN' if rep.ok else 'RED'}: {len(rep.items) - len(fails)}/{len(rep.items)} OK"
+          + (f"; failed: {'; '.join(fails)}" if fails else "") + f"\nWritten to {p}")
+    return 0 if rep.ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
